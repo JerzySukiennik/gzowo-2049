@@ -126,6 +126,14 @@ function handleHostConnection(conn) {
         emit('net:req', { fromPlayerId: conn.peer, kind: msg.kind, data: msg.data });
         break;
       }
+      case 'robot-say': {
+        // A client voiced a robot reply. Host is authoritative: rebroadcast to
+        // all clients (incl. echo back to origin, deduped there) and record it
+        // in robot memory via the ai:robot-reply listener in game.js.
+        broadcastRobotSay(msg.robotId, msg.text);
+        emit('ai:robot-reply', { robotId: msg.robotId, text: msg.text });
+        break;
+      }
       default:
         break;
     }
@@ -326,6 +334,9 @@ export function broadcastRobotSay(robotId, text) {
     emit('net:robot-say', { robotId, text });
   } else if (role === 'solo') {
     emit('net:robot-say', { robotId, text });
+  } else if (role === 'client') {
+    // Route to the host, which rebroadcasts to everyone and records memory.
+    safeSend(hostConn, { t: 'robot-say', robotId, text });
   }
 }
 

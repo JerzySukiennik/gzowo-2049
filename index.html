@@ -6,7 +6,8 @@
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+  "@google/genai": "https://esm.run/@google/genai@1"
 } }
 </script>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
@@ -50,7 +51,7 @@
     </form>
   </div>
   <button id="mic-btn" type="button">&#9679;</button>
-  <div id="controls-hint">WASD ruch &middot; Mysz obr&oacute;t &middot; E &#347;ciana &middot; T czat &middot; M mikrofon</div>
+  <div id="controls-hint">WASD ruch &middot; Mysz obr&oacute;t &middot; E &#347;ciana &middot; T czat &middot; M mikrofon (hold/toggle stream)</div>
 </div>
 
 <script type="module" src="./src/game.js"></script>

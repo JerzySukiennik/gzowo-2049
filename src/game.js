@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import * as database from './database.js';
 import * as multiplayer from './multiplayer.js';
 import * as ai from './ai.js';
+import * as avatars from './avatars.js';
 
 export const bus = new EventTarget();
 
@@ -86,8 +87,13 @@ const WALL_DEFS = [
 
 let renderer, scene, camera, dirLight;
 let playerMesh;
+let playerAvatar = null;
 const robotMeshes = new Map();
 const remoteMeshes = new Map();
+const robotAvatars = new Map();
+const remoteAvatars = new Map();
+const AVATAR_H = 1.8;
+const REMOTE_ACCENT = 0x7df9ff;
 const buildingBoxes = [];
 const keys = new Set();
 let camPitch = 0.15;
@@ -383,18 +389,73 @@ function spawnRemoteAvatar(id, name) {
   scene.add(mesh);
   remoteMeshes.set(id, mesh);
   const i = remoteMeshes.size;
-  state.remotePlayers.set(id, {
+  const rp = {
     name: name || id,
     p: { x: (i % 2 ? 3 : -3), y: 0, z: 20 - i * 2 },
     ry: Math.PI, anim: 'idle',
     targetP: { x: (i % 2 ? 3 : -3), y: 0, z: 20 - i * 2 }, targetRy: Math.PI
-  });
+  };
+  state.remotePlayers.set(id, rp);
+  if (avatars.isReady()) attachRemoteAvatar(id, rp);
 }
 
 function removeRemoteAvatar(id) {
   const mesh = remoteMeshes.get(id);
   if (mesh) { scene.remove(mesh); remoteMeshes.delete(id); }
+  remoteAvatars.delete(id);
   state.remotePlayers.delete(id);
+}
+
+function swapMesh(map, id, group, oldMesh) {
+  if (oldMesh) scene.remove(oldMesh);
+  scene.add(group);
+  map.set(id, group);
+}
+
+function attachRobotAvatar(r) {
+  const av = avatars.createAvatar({ color: r.color, height: AVATAR_H });
+  if (!av) return;
+  av.group.position.set(r.p.x, 0, r.p.z);
+  av.group.rotation.y = r.ry;
+  swapMesh(robotMeshes, r.id, av.group, robotMeshes.get(r.id));
+  robotAvatars.set(r.id, av);
+  av.setAnim(r.anim);
+}
+
+function attachPlayerAvatar() {
+  const av = avatars.createAvatar({ color: '#e8e8ec', accent: ACCENT, height: AVATAR_H });
+  if (!av) return;
+  av.group.position.set(state.player.p.x, 0, state.player.p.z);
+  av.group.rotation.y = state.player.ry;
+  if (playerMesh) scene.remove(playerMesh);
+  scene.add(av.group);
+  playerMesh = av.group;
+  playerAvatar = av;
+  av.setAnim(state.player.anim);
+}
+
+function attachRemoteAvatar(id, rp) {
+  const av = avatars.createAvatar({ color: '#00f0c8', accent: REMOTE_ACCENT, height: AVATAR_H });
+  if (!av) return;
+  av.group.position.set(rp.p.x, 0, rp.p.z);
+  av.group.rotation.y = rp.ry;
+  swapMesh(remoteMeshes, id, av.group, remoteMeshes.get(id));
+  remoteAvatars.set(id, av);
+  av.setAnim(rp.anim);
+}
+
+async function initAvatars() {
+  const proto = await avatars.loadAvatarPrototype('./assets/models/robot.glb');
+  if (!proto) return;
+  for (const r of state.robots.values()) attachRobotAvatar(r);
+  attachPlayerAvatar();
+  for (const [id, rp] of state.remotePlayers) attachRemoteAvatar(id, rp);
+}
+
+function updateMixers(dt) {
+  if (playerAvatar) playerAvatar.update(dt);
+  for (const av of robotAvatars.values()) av.update(dt);
+  for (const av of remoteAvatars.values()) av.update(dt);
 }
 
 function collideMove(oldX, oldZ, dx, dz, r) {
@@ -447,6 +508,7 @@ function updatePlayer() {
 function syncPlayerMesh() {
   playerMesh.position.set(state.player.p.x, 0, state.player.p.z);
   playerMesh.rotation.y = state.player.ry;
+  if (playerAvatar) playerAvatar.setAnim(state.player.anim);
 }
 
 function seek(ent, tx, tz, speed) {
@@ -499,6 +561,43 @@ function resumeDuty(r) {
   setAction(r, 'on duty');
 }
 
+function setConversation(active, robotId) {
+  if (state.mode !== 'host' && state.mode !== 'solo') return;
+  const r = state.robots.get(robotId);
+  if (!r) return;
+  if (active) {
+    if (r.fsm === 'CONVERSING' || r.fsm === 'ESCORT' || r.fsm === 'ARRESTED' || r.fsm === 'CHASE') return;
+    r.prevFsm = r.fsm;
+    r.prevTarget = r.target;
+    r.prevWaypoints = r.waypoints;
+    r.prevWpIndex = r.wpIndex;
+    r.fsm = 'CONVERSING';
+    r.anim = 'idle';
+  } else {
+    if (r.fsm !== 'CONVERSING') return;
+    if (r.prevFsm && r.prevFsm !== 'CONVERSING') {
+      r.fsm = r.prevFsm;
+      r.target = r.prevTarget;
+      r.waypoints = r.prevWaypoints;
+      r.wpIndex = r.prevWpIndex || 0;
+    } else {
+      r.fsm = 'WANDER';
+      pickWander(r);
+    }
+    r.prevFsm = null;
+  }
+}
+
+function appendRobotReply(robotId, text) {
+  if (state.mode !== 'host' && state.mode !== 'solo') return;
+  const r = state.robots.get(robotId);
+  if (!r) return;
+  const entry = 'Said: ' + text;
+  r.memory.push(entry);
+  if (r.memory.length > 20) r.memory = r.memory.slice(-20);
+  database.saveRobotAction(r.id, r.currentAction, entry);
+}
+
 function setAction(r, action, memoryEntry) {
   r.currentAction = action;
   if (state.mode === 'host' || state.mode === 'solo') {
@@ -510,7 +609,7 @@ function setAction(r, action, memoryEntry) {
 function updateRobot(r) {
   r.stateTimer += STEP;
   const police = r.role === 'police';
-  if (police && r.fsm !== 'CHASE' && r.fsm !== 'ESCORT') {
+  if (police && r.fsm !== 'CHASE' && r.fsm !== 'ESCORT' && r.fsm !== 'CONVERSING' && r.fsm !== 'ARRESTED') {
     r.scanTimer += STEP;
     if (r.scanTimer >= 2) {
       r.scanTimer = 0;
@@ -574,7 +673,7 @@ function updateRobot(r) {
     case 'DANCE': {
       r.danceT += STEP;
       r.ry = Math.sin(r.danceT * 6) * 1.2;
-      r.anim = 'idle';
+      r.anim = 'dance';
       if (r.danceT > 10) { r.danceT = 0; resumeDuty(r); }
       break;
     }
@@ -619,7 +718,12 @@ function updateRobot(r) {
       const d = Math.hypot(dx, dz);
       if (d > 4) { r.p.x = cap.p.x - (dx / d) * 2.5; r.p.z = cap.p.z - (dz / d) * 2.5; }
       else if (d > 2.5) seek(r, cap.p.x - (dx / d) * 2.5, cap.p.z - (dz / d) * 2.5, r.speed);
-      r.anim = 'walk';
+      r.anim = 'arrested';
+      break;
+    }
+    case 'CONVERSING': {
+      r.ry = Math.atan2(state.player.p.x - r.p.x, state.player.p.z - r.p.z);
+      r.anim = 'idle';
       break;
     }
     default: r.anim = 'idle';
@@ -731,6 +835,8 @@ function syncRobotMesh(r) {
   if (!mesh) return;
   mesh.position.set(r.p.x, r.fsm === 'DANCE' ? Math.abs(Math.sin(r.danceT * 6)) * 0.3 : 0, r.p.z);
   mesh.rotation.y = r.ry;
+  const av = robotAvatars.get(r.id);
+  if (av) av.setAnim(r.anim);
 }
 
 function updatePlayerArrest() {
@@ -765,6 +871,8 @@ function lerpEntities() {
     rp.ry += dry * LERP;
     const mesh = remoteMeshes.get(id);
     if (mesh) { mesh.position.set(rp.p.x, 0, rp.p.z); mesh.rotation.y = rp.ry; }
+    const av = remoteAvatars.get(id);
+    if (av) av.setAnim(rp.anim);
   }
   if (state.mode === 'client') {
     for (const r of state.robots.values()) {
@@ -824,6 +932,7 @@ function simStep() {
     updatePlayer();
   }
   lerpEntities();
+  updateMixers(STEP);
   updateCamera();
 
   if (state.tick % 3 === 0) {
@@ -1238,6 +1347,9 @@ function wireBus() {
 
   bus.addEventListener('chat:incoming', (e) => renderChatMessage(e.detail.from, e.detail.text));
 
+  bus.addEventListener('ai:conversation', (e) => setConversation(!!e.detail.active, e.detail.robotId));
+  bus.addEventListener('ai:robot-reply', (e) => appendRobotReply(e.detail.robotId, e.detail.text));
+
   bus.addEventListener('ui:status', (e) => {
     const pill = el('status-pill');
     if (!pill) return;
@@ -1275,7 +1387,7 @@ function setupInput() {
   document.addEventListener('mousemove', (e) => {
     if (!pointerLocked) return;
     state.player.ry -= e.movementX * 0.0025;
-    camPitch = clamp(camPitch - e.movementY * 0.0025, -0.4, 0.6);
+    camPitch = clamp(camPitch + e.movementY * 0.0025, -0.4, 0.6);
   });
 
   window.addEventListener('keydown', (e) => {
@@ -1377,6 +1489,7 @@ function wireLobby() {
 function init() {
   state.playerName = getPlayerName();
   buildScene();
+  initAvatars();
   setupInput();
   wireBus();
   wireLobby();

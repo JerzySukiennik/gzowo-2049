@@ -8,16 +8,21 @@ voice, order them around, get arrested by robot police. No build step, no login.
 ## Features
 
 - Cyber city with a Main Square and a Prison sector, 27 destructible walls
-- 10 AI robots (civilian + police) driven by Gemini as an intent parser —
-  speak (mic button, `M`) or type (`T`) natural language, robots execute
-  parsed actions (move, follow, destroy/repair walls, arrest, patrol, dance…)
+- 10 AI robots (civilian + police) voiced by ONE Gemini Live model
+  (`gemini-3.1-flash-live-preview`) over WebSocket — speak (mic button, `M`,
+  audio streams straight to Gemini) or type (`T`); the model answers with
+  native voice AND executes game actions via function calling (move, follow,
+  destroy/repair walls, arrest, patrol, dance…)
+- Animated GLB avatars (three.js RobotExpressive, CC0) for robots, the player
+  and remote players — per-entity tint, runtime Box3 scaling
+- Robots stop and face you while you talk to them
 - Robot police: wanted list, chase, arrest and physical escort to the Prison
 - Persistent robot memory in Firestore — robots remember past events across
   sessions
 - Hybrid multiplayer: PeerJS/WebRTC for smooth position sync + Firestore
   (`onSnapshot`) for lobby registry, world state and chat
-- Robot voices: Gemini TTS with browser speechSynthesis fallback (randomized
-  pitch per robot)
+- Robot voices: native Gemini Live audio; remote players hear robot lines via
+  speechSynthesis fallback (randomized pitch per robot)
 
 ## Controls
 
@@ -33,9 +38,12 @@ voice, order them around, get arrested by robot police. No build step, no login.
   client-side interpolation
 - `src/database.js` — Firebase/Firestore: lobbies, robot memory, world state,
   chat
-- `src/ai.js` — SpeechRecognition, intent requests, TTS playback
-- `worker/` — Cloudflare Worker proxy that holds the Gemini API key server-side
-  (the key is never in this repo or in the browser)
+- `src/ai.js` — Gemini Live session (mic streaming in, PCM voice out, robot_action
+  function calls, live subtitles from transcription)
+- `src/avatars.js` — GLB avatar loading/cloning/animation
+- `worker/` — Cloudflare Worker that mints short-lived single-use Gemini tokens;
+  the real API key lives only in the Worker's secret store (never in this repo
+  or in the browser)
 
 The Firebase config in `src/database.js` contains public identifiers only —
 access is controlled by Firestore security rules (`firestore.rules`).

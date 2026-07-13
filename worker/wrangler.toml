@@ -1,0 +1,15 @@
+# worker/wrangler.toml — Cloudflare Worker for Gzowo 2049.
+# Holds the Gemini API key server-side (encrypted secret) and proxies
+# intent-parsing + TTS requests from the deployed game. The key NEVER
+# ships to the browser or the repo.
+
+name = "gzowo-2049-worker"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+# CORS allowlist: GitHub Pages + local dev.
+ALLOWED_ORIGINS = "https://jerzysukiennik.github.io,http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173"
+
+# Secret (set via: npx wrangler secret put GEMINI_API_KEY):
+#   GEMINI_API_KEY — the Gemini key. Never in this file, never in the repo.

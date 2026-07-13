@@ -1,0 +1,4 @@
+.env
+Niepotrzebne/
+.DS_Store
+worker/.wrangler/

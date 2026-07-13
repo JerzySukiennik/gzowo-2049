@@ -1,0 +1,43 @@
+rules_version = '2';
+
+// Gzowo 2049 — open-world game with no player accounts.
+// Access is public by design (anonymous multiplayer), but scoped to the
+// game's collections only and size-capped so strangers can't dump blobs.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function smallDoc() {
+      return request.resource == null || request.resource.size() < 40;
+    }
+
+    // Open lobby registry for matchmaking.
+    match /lobbies/{lobbyId} {
+      allow read: if true;
+      allow write: if smallDoc();
+    }
+
+    // Persistent robot memory (id, name, color, role, currentAction,
+    // inventory, memory[]).
+    match /robots/{robotId} {
+      allow read: if true;
+      allow write: if smallDoc();
+    }
+
+    // Structural world state per lobby (destroyed walls, wanted list).
+    match /world/{docId} {
+      allow read: if true;
+      allow write: if smallDoc();
+    }
+
+    // Chat / AI action log.
+    match /chat/{msgId} {
+      allow read: if true;
+      allow create: if smallDoc();
+      allow update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

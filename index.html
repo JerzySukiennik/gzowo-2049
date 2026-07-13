@@ -1,0 +1,56 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gzowo 2049</title>
+<link rel="stylesheet" href="./style.css">
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+<canvas id="game-canvas"></canvas>
+
+<div id="loading" class="overlay">
+  <h1 class="logo">GZOWO 2049</h1>
+  <div id="loading-text">Inicjalizacja...</div>
+  <div class="spinner"></div>
+</div>
+
+<div id="lobby-modal" class="overlay hidden">
+  <h1 class="logo">GZOWO 2049</h1>
+  <p class="tagline">Cyfrowe miasto · multiplayer · roboty AI</p>
+  <div class="panel">
+    <input id="player-name-input" maxlength="16" placeholder="Twoja nazwa" autocomplete="off">
+    <input id="lobby-name-input" maxlength="24" placeholder="Nazwa lobby" autocomplete="off">
+    <div class="btn-row">
+      <button id="btn-create-lobby" class="btn btn-primary">HOSTUJ</button>
+      <button id="btn-solo" class="btn">GRAJ SOLO</button>
+    </div>
+    <div class="lobby-head">
+      <span class="lobby-head-title">Otwarte lobby</span>
+      <button id="btn-refresh-lobbies" class="btn btn-ghost">ODŚWIEŻ</button>
+    </div>
+    <ul id="lobby-list"></ul>
+  </div>
+</div>
+
+<div id="hud" class="hidden">
+  <div id="status-pill"></div>
+  <div id="wanted-list"></div>
+  <div id="target-robot"></div>
+  <div id="crosshair"></div>
+  <div id="subtitles"></div>
+  <div id="chat-panel">
+    <div id="chat-log"></div>
+    <form id="chat-form">
+      <input id="chat-input" maxlength="200" placeholder="Powiedz coś do robota... (Enter)" autocomplete="off">
+    </form>
+  </div>
+  <button id="mic-btn" type="button">&#9679;</button>
+  <div id="controls-hint">WASD ruch &middot; Mysz obr&oacute;t &middot; E &#347;ciana &middot; T czat &middot; M mikrofon</div>
+</div>
+
+<script type="module" src="./src/game.js"></script>

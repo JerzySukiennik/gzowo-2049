@@ -13,9 +13,13 @@ voice, order them around, get arrested by robot police. No build step, no login.
   audio streams straight to Gemini) or type (`T`); the model answers with
   native voice AND executes game actions via function calling (move, follow,
   destroy/repair walls, arrest, patrol, dance…)
-- Animated GLB avatars (three.js RobotExpressive, CC0) for robots, the player
-  and remote players — per-entity tint, runtime Box3 scaling
+- Animated GLB avatars (Quaternius "Animated Robot", CC0) for robots, the
+  player and remote players — per-entity tint, runtime Box3 scaling
 - Robots stop and face you while you talk to them
+- Grid A* navigation — robots route around buildings and walls and use the
+  prison gate; destroying a wall opens a new path
+- A robotic manipulator arm guards the prison gate: it tracks, grabs and
+  dumps wanted robots into the yard
 - Robot police: wanted list, chase, arrest and physical escort to the Prison
 - Persistent robot memory in Firestore — robots remember past events across
   sessions
@@ -40,7 +44,10 @@ voice, order them around, get arrested by robot police. No build step, no login.
   chat
 - `src/ai.js` — Gemini Live session (mic streaming in, PCM voice out, robot_action
   function calls, live subtitles from transcription)
-- `src/avatars.js` — GLB avatar loading/cloning/animation
+- `src/avatars.js` — GLB avatar loading/cloning/animation (model: "Animated
+  Robot" by Quaternius, CC0, quaternius.com)
+- `src/nav.js` — walkability grid + A* pathfinding
+- `src/manipulator.js` — procedural prison-gate guard arm
 - `worker/` — Cloudflare Worker that mints short-lived single-use Gemini tokens;
   the real API key lives only in the Worker's secret store (never in this repo
   or in the browser)

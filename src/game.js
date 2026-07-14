@@ -5,6 +5,8 @@ import * as database from './database.js';
 import * as multiplayer from './multiplayer.js';
 import * as ai from './ai.js';
 import * as avatars from './avatars.js';
+import * as nav from './nav.js';
+import * as manipulator from './manipulator.js';
 
 export const bus = new EventTarget();
 
@@ -26,6 +28,18 @@ const ACCENT = 0x00f0c8;
 const ALERT = 0xff3860;
 const SEEK_ARRIVE = 1.2;
 const LERP = 1 - Math.pow(0.001, STEP);
+const WORLD_BOUND = 100;
+const NAV_CELL = 2;
+const REPLAN_INTERVAL = 1.5;
+const REPLAN_MOVE2 = 4;
+// Waypoint-advance radius (1.5m) must exceed SEEK_ARRIVE (1.2m), else a robot can
+// halt between the two thresholds — seek stops moving but the waypoint never advances.
+const WAYPOINT_ARRIVE2 = 2.25;
+const STUCK_TIME = 2;
+const STUCK_DIST2 = 0.04;
+const MAX_REPLAN_FAILS = 3;
+const REPLANS_PER_STEP = 2;
+let replanBudget = 0;
 
 const CELL_POINTS = [
   { x: 62, z: -78 }, { x: 66, z: -78 }, { x: 70, z: -78 }, { x: 74, z: -78 }, { x: 78, z: -78 }
@@ -36,7 +50,7 @@ const SQUARE_CORNERS = [
   { x: 16, z: 16 }, { x: 16, z: -16 }, { x: -16, z: -16 }, { x: -16, z: 16 }
 ];
 const PRISON_ROUTE = [
-  { x: 0, z: -20 }, { x: 28, z: -28 }, { x: 56, z: -52 }, { x: 70, z: -56 }, { x: 56, z: -52 }, { x: 28, z: -28 }
+  { x: 0, z: -20 }, { x: 28, z: -28 }, { x: 56, z: -49 }, { x: 70, z: -56 }, { x: 56, z: -49 }, { x: 28, z: -28 }
 ];
 const SE_ROUTE = [
   { x: 28, z: 28 }, { x: 56, z: 28 }, { x: 56, z: 56 }, { x: 28, z: 56 }
@@ -92,8 +106,10 @@ const robotMeshes = new Map();
 const remoteMeshes = new Map();
 const robotAvatars = new Map();
 const remoteAvatars = new Map();
-const AVATAR_H = 1.8;
+const ROBOT_H = 1.4;
+const PLAYER_H = 1.5;
 const REMOTE_ACCENT = 0x7df9ff;
+let manipulatorInst = null;
 const buildingBoxes = [];
 const keys = new Set();
 let camPitch = 0.15;
@@ -185,8 +201,10 @@ function buildScene() {
   buildSquare();
   buildPrison();
   buildWalls();
+  initNav();
   buildRobots();
   buildPlayer();
+  initManipulator();
   updateCamera();
 }
 
@@ -325,6 +343,14 @@ function buildWalls() {
   }
 }
 
+function initNav() {
+  // Bounds derived from the movement clamp (±WORLD_BOUND); obstacles come straight
+  // from the collision data the world was built with — no duplicated geometry.
+  nav.configure({ minX: -WORLD_BOUND, maxX: WORLD_BOUND, minZ: -WORLD_BOUND, maxZ: WORLD_BOUND, cell: NAV_CELL, inflate: 0.7 });
+  for (const box of buildingBoxes) nav.addObstacle(box);
+  for (const [id, w] of state.walls) nav.registerWall(id, w.box, w.destroyed);
+}
+
 function makeRobotMesh(color, police) {
   const group = new THREE.Group();
   const mat = new THREE.MeshStandardMaterial({ color: new THREE.Color(color), roughness: 0.5, metalness: 0.3, emissive: new THREE.Color(color).multiplyScalar(0.15) });
@@ -367,7 +393,10 @@ function buildRobots() {
       inventory: [], memory: [], currentAction: 'idle',
       stateTimer: 0, scanTimer: 0, danceT: 0,
       dutyFsm: duty.fsm, dutyWaypoints: duty.waypoints, dutyTarget: duty.target,
-      targetP: { x: def.x, z: def.z }, targetRy: 0, anim: 'idle'
+      targetP: { x: def.x, z: def.z }, targetRy: 0, anim: 'idle', heldY: 0,
+      navPath: null, navIndex: 0, navDest: null, navArrived: false,
+      replanAcc: Math.random() * REPLAN_INTERVAL, stuckAcc: 0,
+      stuckX: def.x, stuckZ: def.z, replanFails: 0
     };
     state.robots.set(def.id, r);
     const mesh = makeRobotMesh(def.color, police);
@@ -413,7 +442,7 @@ function swapMesh(map, id, group, oldMesh) {
 }
 
 function attachRobotAvatar(r) {
-  const av = avatars.createAvatar({ color: r.color, height: AVATAR_H });
+  const av = avatars.createAvatar({ color: r.color, height: ROBOT_H });
   if (!av) return;
   av.group.position.set(r.p.x, 0, r.p.z);
   av.group.rotation.y = r.ry;
@@ -423,7 +452,7 @@ function attachRobotAvatar(r) {
 }
 
 function attachPlayerAvatar() {
-  const av = avatars.createAvatar({ color: '#e8e8ec', accent: ACCENT, height: AVATAR_H });
+  const av = avatars.createAvatar({ color: '#e8e8ec', accent: ACCENT, height: PLAYER_H });
   if (!av) return;
   av.group.position.set(state.player.p.x, 0, state.player.p.z);
   av.group.rotation.y = state.player.ry;
@@ -435,7 +464,7 @@ function attachPlayerAvatar() {
 }
 
 function attachRemoteAvatar(id, rp) {
-  const av = avatars.createAvatar({ color: '#00f0c8', accent: REMOTE_ACCENT, height: AVATAR_H });
+  const av = avatars.createAvatar({ color: '#00f0c8', accent: REMOTE_ACCENT, height: PLAYER_H });
   if (!av) return;
   av.group.position.set(rp.p.x, 0, rp.p.z);
   av.group.rotation.y = rp.ry;
@@ -445,7 +474,7 @@ function attachRemoteAvatar(id, rp) {
 }
 
 async function initAvatars() {
-  const proto = await avatars.loadAvatarPrototype('./assets/models/robot.glb');
+  const proto = await avatars.loadAvatarPrototype('./assets/models/robot2.glb');
   if (!proto) return;
   for (const r of state.robots.values()) attachRobotAvatar(r);
   attachPlayerAvatar();
@@ -523,6 +552,71 @@ function seek(ent, tx, tz, speed) {
   return d;
 }
 
+function clearPath(r) {
+  r.navPath = null; r.navIndex = 0; r.navDest = null; r.navArrived = false;
+  r.replanFails = 0; r.stuckAcc = 0; r.stuckX = r.p.x; r.stuckZ = r.p.z;
+}
+
+// Path-following mover: plans/replans a route to (destX,destZ) with nav, follows
+// the waypoints via seek(), and returns straight-line distance to the true dest so
+// callers keep their own arrival thresholds. Sets r.navArrived when the robot has
+// reached the closest reachable point (final waypoint). Replans are staggered by a
+// global per-step budget and driven by SIM time so debugStep stays deterministic.
+function robotFollow(r, destX, destZ, speed) {
+  r.navArrived = false;
+
+  r.stuckAcc += STEP;
+  if (r.stuckAcc >= STUCK_TIME) {
+    const moved = dist2(r.stuckX, r.stuckZ, r.p.x, r.p.z) >= STUCK_DIST2;
+    if (!moved && r.navPath) r.navPath = null; // barely moved: force a replan
+    if (moved) r.replanFails = 0;              // actually moved: not trapped
+    r.stuckX = r.p.x; r.stuckZ = r.p.z; r.stuckAcc = 0;
+  }
+
+  r.replanAcc += STEP;
+  let need = false;
+  if (!r.navPath || r.navIndex >= r.navPath.length) need = true;
+  else if (!r.navDest || dist2(r.navDest.x, r.navDest.z, destX, destZ) > REPLAN_MOVE2) need = true;
+  else if (r.replanAcc >= REPLAN_INTERVAL) need = true;
+
+  if (need && replanBudget > 0) {
+    replanBudget--;
+    r.replanAcc = 0;
+    let path = nav.findPath(r.p.x, r.p.z, destX, destZ);
+    if (path) {
+      r.replanFails = 0;
+    } else {
+      r.replanFails++;
+      if (r.replanFails >= MAX_REPLAN_FAILS) {
+        const fb = nav.progressToward(r.p.x, r.p.z, destX, destZ);
+        path = fb ? [fb] : null;
+      }
+    }
+    r.navPath = path;
+    r.navIndex = 0;
+    r.navDest = { x: destX, z: destZ };
+  }
+
+  let wpx = destX, wpz = destZ;
+  if (r.navPath && r.navIndex < r.navPath.length) {
+    while (r.navIndex < r.navPath.length - 1 &&
+      dist2(r.p.x, r.p.z, r.navPath[r.navIndex].x, r.navPath[r.navIndex].z) <= WAYPOINT_ARRIVE2) {
+      r.navIndex++;
+    }
+    const wp = r.navPath[r.navIndex];
+    const atLast = r.navIndex === r.navPath.length - 1;
+    if (atLast && dist2(r.p.x, r.p.z, wp.x, wp.z) <= WAYPOINT_ARRIVE2) {
+      r.navArrived = true;
+      wpx = destX; wpz = destZ;
+    } else {
+      wpx = wp.x; wpz = wp.z;
+    }
+  }
+
+  seek(r, wpx, wpz, speed);
+  return Math.hypot(destX - r.p.x, destZ - r.p.z);
+}
+
 function entityPos(id) {
   if (id === state.playerId || id === 'solo') return { x: state.player.p.x, z: state.player.p.z };
   const rp = state.remotePlayers.get(id);
@@ -558,6 +652,7 @@ function resumeDuty(r) {
   r.target = r.dutyTarget;
   r.wpIndex = 0;
   r.followId = null;
+  clearPath(r);
   setAction(r, 'on duty');
 }
 
@@ -609,7 +704,7 @@ function setAction(r, action, memoryEntry) {
 function updateRobot(r) {
   r.stateTimer += STEP;
   const police = r.role === 'police';
-  if (police && r.fsm !== 'CHASE' && r.fsm !== 'ESCORT' && r.fsm !== 'CONVERSING' && r.fsm !== 'ARRESTED') {
+  if (police && r.fsm !== 'CHASE' && r.fsm !== 'ESCORT' && r.fsm !== 'CONVERSING' && r.fsm !== 'ARRESTED' && r.fsm !== 'HELD') {
     r.scanTimer += STEP;
     if (r.scanTimer >= 2) {
       r.scanTimer = 0;
@@ -633,24 +728,24 @@ function updateRobot(r) {
     }
     case 'WANDER': {
       if (!r.target) pickWander(r);
-      const d = seek(r, r.target.x, r.target.z, r.speed);
+      const d = robotFollow(r, r.target.x, r.target.z, r.speed);
       r.anim = 'walk';
-      if (d <= SEEK_ARRIVE) { r.fsm = 'IDLE'; r.stateTimer = 0; r.target = null; r.anim = 'idle'; }
+      if (d <= SEEK_ARRIVE || r.navArrived) { r.fsm = 'IDLE'; r.stateTimer = 0; r.target = null; r.anim = 'idle'; clearPath(r); }
       break;
     }
     case 'PATROL': {
       if (!r.waypoints || r.waypoints.length === 0) { r.fsm = 'IDLE'; break; }
       const wp = r.waypoints[r.wpIndex % r.waypoints.length];
-      const d = seek(r, wp.x, wp.z, r.speed);
+      const d = robotFollow(r, wp.x, wp.z, r.speed);
       r.anim = 'walk';
-      if (d <= SEEK_ARRIVE) r.wpIndex = (r.wpIndex + 1) % r.waypoints.length;
+      if (d <= SEEK_ARRIVE || r.navArrived) { r.wpIndex = (r.wpIndex + 1) % r.waypoints.length; clearPath(r); }
       break;
     }
     case 'MOVE_TO': {
       if (!r.target) { r.fsm = 'IDLE'; break; }
-      const d = seek(r, r.target.x, r.target.z, r.speed);
+      const d = robotFollow(r, r.target.x, r.target.z, r.speed);
       r.anim = 'walk';
-      if (d <= SEEK_ARRIVE) { r.fsm = 'IDLE'; r.stateTimer = 0; r.target = null; r.anim = 'idle'; }
+      if (d <= SEEK_ARRIVE || r.navArrived) { r.fsm = 'IDLE'; r.stateTimer = 0; r.target = null; r.anim = 'idle'; clearPath(r); }
       break;
     }
     case 'FOLLOW': {
@@ -658,15 +753,18 @@ function updateRobot(r) {
       if (!tp) { r.fsm = 'IDLE'; break; }
       const dx = tp.x - r.p.x, dz = tp.z - r.p.z;
       const d = Math.hypot(dx, dz);
-      if (d > 2.5) seek(r, tp.x - (dx / d) * 2.5, tp.z - (dz / d) * 2.5, r.speed);
-      else r.ry = Math.atan2(dx, dz);
-      r.anim = d > 2.7 ? 'walk' : 'idle';
+      if (d > 2.7) { robotFollow(r, tp.x, tp.z, r.speed); r.anim = 'walk'; }
+      else { r.ry = Math.atan2(dx, dz); r.anim = 'idle'; clearPath(r); }
       break;
     }
     case 'GUARD': {
-      if (r.target) r.ry = Math.atan2(r.target.x - r.p.x || 0.001, (r.target.z - r.p.z));
       const gx = r.target ? r.target.x : r.spawn.x, gz = r.target ? r.target.z : r.spawn.z;
-      seek(r, gx, gz, r.speed);
+      if (Math.hypot(gx - r.p.x, gz - r.p.z) > SEEK_ARRIVE) {
+        robotFollow(r, gx, gz, r.speed);
+      } else {
+        if (r.target) r.ry = Math.atan2((r.target.x - r.p.x) || 0.001, (r.target.z - r.p.z));
+        if (r.navPath) clearPath(r);
+      }
       r.anim = 'idle';
       break;
     }
@@ -680,8 +778,8 @@ function updateRobot(r) {
     case 'WORK_WALL': {
       const w = state.walls.get(r.target && r.target.wallId);
       if (!w) { r.fsm = 'IDLE'; break; }
-      const cx = (w.box.minX + w.box.maxX) / 2, cz = (w.box.minZ + w.box.maxZ) / 2;
-      seek(r, cx, cz, r.speed);
+      const wcx = (w.box.minX + w.box.maxX) / 2, wcz = (w.box.minZ + w.box.maxZ) / 2;
+      robotFollow(r, wcx, wcz, r.speed);
       // Arrival = distance to the wall BOX, not its center — the wall's own
       // collision body stops the robot before it can ever reach the center.
       const nx = clamp(r.p.x, w.box.minX, w.box.maxX), nz = clamp(r.p.z, w.box.minZ, w.box.maxZ);
@@ -694,17 +792,21 @@ function updateRobot(r) {
           applyWorldEvent('wall', { wallId: r.target.wallId, destroyed: r.target.destroyed });
           setAction(r, (r.target.destroyed ? 'destroyed ' : 'repaired ') + r.target.wallId,
             (r.target.destroyed ? 'Destroyed ' : 'Repaired ') + r.target.wallId);
-          r.fsm = 'IDLE'; r.stateTimer = 0; r.target = null;
+          r.fsm = 'IDLE'; r.stateTimer = 0; r.target = null; clearPath(r);
         }
       }
       break;
     }
     case 'CHASE': {
+      // Bail if the quarry got grabbed by the Manipulator — chasing/arresting a
+      // robot pinned in the gripper would fight updateHeld() for the FSM.
+      const followed = state.robots.get(r.followId);
+      if (followed && followed.fsm === 'HELD') { r.fsm = 'IDLE'; r.followId = null; clearPath(r); break; }
       const tp = entityPos(r.followId);
-      if (!tp) { r.fsm = 'IDLE'; r.followId = null; break; }
-      const d = seek(r, tp.x, tp.z, r.speed);
+      if (!tp) { r.fsm = 'IDLE'; r.followId = null; clearPath(r); break; }
+      const d = robotFollow(r, tp.x, tp.z, r.speed);
       r.anim = 'run';
-      if (d <= 2.5) doArrest(r, r.followId);
+      if (d <= 2.5) { doArrest(r, r.followId); clearPath(r); }
       break;
     }
     case 'ESCORT': {
@@ -726,15 +828,26 @@ function updateRobot(r) {
       r.anim = 'idle';
       break;
     }
+    case 'HELD': {
+      // Driven by the Manipulator (position + heldY set from manipulator.step).
+      r.anim = 'arrested';
+      break;
+    }
     default: r.anim = 'idle';
   }
   syncRobotMesh(r);
 }
 
 function pickWander(r) {
-  const a = Math.random() * Math.PI * 2;
-  const rad = Math.random() * 15;
-  r.target = { x: clamp(r.spawn.x + Math.cos(a) * rad, -100, 100), z: clamp(r.spawn.z + Math.sin(a) * rad, -100, 100) };
+  for (let i = 0; i < 6; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const rad = 3 + Math.random() * 12;
+    const x = clamp(r.spawn.x + Math.cos(a) * rad, -WORLD_BOUND, WORLD_BOUND);
+    const z = clamp(r.spawn.z + Math.sin(a) * rad, -WORLD_BOUND, WORLD_BOUND);
+    if (nav.isWalkable(x, z)) { r.target = { x, z }; clearPath(r); return; }
+  }
+  r.target = { x: r.spawn.x, z: r.spawn.z };
+  clearPath(r);
 }
 
 function policeScan(r) {
@@ -749,6 +862,9 @@ function policeScan(r) {
   for (const [id, rp] of state.remotePlayers) check(rp.name || id, id, rp.p.x, rp.p.z);
   for (const t of state.robots.values()) {
     if (t.id === r.id) continue;
+    // Skip robots the Manipulator has grabbed — they're pinned in the gripper
+    // and their wanted flag clears at grab time; don't send police after them.
+    if (t.fsm === 'HELD') continue;
     check(t.name, t.id, t.p.x, t.p.z);
   }
   return best;
@@ -761,6 +877,7 @@ function doArrest(officer, targetId) {
   officer.escortWps = [GATE_WP, cp];
   officer.escortIndex = 0;
   officer.fsm = 'ESCORT';
+  clearPath(officer);
   const tRobot = state.robots.get(targetId);
   if (tRobot) {
     tRobot.fsm = 'ARRESTED';
@@ -778,14 +895,16 @@ function doArrest(officer, targetId) {
 
 function escortStep(officer) {
   const wp = officer.escortWps[officer.escortIndex];
-  const d = seek(officer, wp.x, wp.z, officer.speed);
+  const d = robotFollow(officer, wp.x, wp.z, officer.speed);
   officer.anim = 'walk';
   const prisonerId = officer.escortId && officer.escortId.startsWith('player:') ? officer.escortId.slice(7) : null;
   if (prisonerId) dragPlayer(prisonerId, officer);
-  if (d <= SEEK_ARRIVE) {
+  if (d <= SEEK_ARRIVE || officer.navArrived) {
     if (officer.escortIndex < officer.escortWps.length - 1) {
       officer.escortIndex++;
+      clearPath(officer);
     } else {
+      clearPath(officer);
       finishEscort(officer, prisonerId);
     }
   }
@@ -830,10 +949,53 @@ function finishEscort(officer, prisonerId) {
   resumeDuty(officer);
 }
 
+// --- Manipulator hooks -----------------------------------------------------
+// The prison-gate arm can hijack a prisoner mid-escort. Free the officer's reserved
+// cell and hand it straight back to its patrol/guard duty (mirrors finishEscort cleanup).
+function handOffEscort(officer) {
+  if (officer.cellIndex >= 0) cellOccupied.delete(officer.cellIndex);
+  officer.escortId = null; officer.escortWps = null; officer.cellIndex = -1;
+  officer.captorId = null;
+  resumeDuty(officer);
+}
+
+// Drop a grabbed robot into the prison yard on a walkable cell: it becomes a free
+// prisoner (re-homed spawn, wanders the yard) and its wanted status clears.
+// Clear a robot's wanted status via the synced world-event (used when the
+// Manipulator grabs it, so police stop targeting the pinned robot immediately).
+function clearWanted(r) {
+  const list = state.wanted.filter((n) => n !== r.name.toLowerCase());
+  if (list.length !== state.wanted.length) applyWorldEvent('wanted', { list });
+}
+
+function jailRobotInYard(r, cell) {
+  r.spawn = { x: cell.x, z: cell.z };
+  r.p.x = cell.x; r.p.z = cell.z; r.heldY = 0;
+  r.captorId = null;
+  r.fsm = 'WANDER';
+  pickWander(r);
+  const list = state.wanted.filter((n) => n !== r.name.toLowerCase());
+  if (list.length !== state.wanted.length) applyWorldEvent('wanted', { list });
+  setAction(r, 'on duty', 'Thrown into the yard by the Manipulator');
+}
+
+function initManipulator() {
+  manipulatorInst = manipulator.init({
+    scene,
+    state,
+    nav,
+    base: { x: 73, z: -48 },
+    gate: { x: GATE_WP.x, z: GATE_WP.z },
+    palette: { body: 0x2a2a34, metal: 0x14141c, joint: 0x3a3a46, accent: ACCENT, alert: ALERT },
+    hooks: { setAction, handOffEscort, jailRobotInYard, syncRobotMesh, clearWanted }
+  });
+}
+
 function syncRobotMesh(r) {
   const mesh = robotMeshes.get(r.id);
   if (!mesh) return;
-  mesh.position.set(r.p.x, r.fsm === 'DANCE' ? Math.abs(Math.sin(r.danceT * 6)) * 0.3 : 0, r.p.z);
+  const y = (r.heldY && r.heldY > 0) ? r.heldY : (r.fsm === 'DANCE' ? Math.abs(Math.sin(r.danceT * 6)) * 0.3 : 0);
+  mesh.position.set(r.p.x, y, r.p.z);
   mesh.rotation.y = r.ry;
   const av = robotAvatars.get(r.id);
   if (av) av.setAnim(r.anim);
@@ -926,11 +1088,13 @@ function simStep() {
   state.tick++;
   if (state.mode === 'host' || state.mode === 'solo') {
     updatePlayer();
+    replanBudget = REPLANS_PER_STEP;
     for (const r of state.robots.values()) updateRobot(r);
     updatePlayerArrest();
   } else if (state.mode === 'client') {
     updatePlayer();
   }
+  if (manipulatorInst) manipulatorInst.step(STEP);
   lerpEntities();
   updateMixers(STEP);
   updateCamera();
@@ -1033,12 +1197,12 @@ export function applyIntent(robotId, intent, fromPlayerId) {
   switch (action) {
     case 'MOVE_TO': {
       r.target = resolveMoveTarget(r, intent, from);
-      r.fsm = 'MOVE_TO'; r.stateTimer = 0;
+      r.fsm = 'MOVE_TO'; r.stateTimer = 0; clearPath(r);
       setAction(r, 'moving to ' + (intent.target || 'a point'), 'Command: move');
       break;
     }
     case 'FOLLOW_PLAYER': {
-      r.followId = from; r.fsm = 'FOLLOW';
+      r.followId = from; r.fsm = 'FOLLOW'; clearPath(r);
       setAction(r, 'following ' + state.playerName, 'Command: follow');
       break;
     }
@@ -1048,7 +1212,7 @@ export function applyIntent(robotId, intent, fromPlayerId) {
       let wallId = intent.target;
       if (!state.walls.has(wallId)) wallId = findNearestWall(r.p.x, r.p.z, !destroyed);
       if (wallId) {
-        r.target = { wallId, destroyed }; r.fsm = 'WORK_WALL'; r.stateTimer = 0;
+        r.target = { wallId, destroyed }; r.fsm = 'WORK_WALL'; r.stateTimer = 0; clearPath(r);
         setAction(r, (destroyed ? 'heading to break ' : 'heading to fix ') + wallId);
       }
       break;
@@ -1060,7 +1224,7 @@ export function applyIntent(robotId, intent, fromPlayerId) {
         applyWorldEvent('wanted', { list: state.wanted.concat([name]) });
       }
       const ent = nameToEntity(name);
-      if (ent) { r.fsm = 'CHASE'; r.followId = ent.id; setAction(r, 'chasing ' + (intent.target || name)); }
+      if (ent) { r.fsm = 'CHASE'; r.followId = ent.id; clearPath(r); setAction(r, 'chasing ' + (intent.target || name)); }
       break;
     }
     case 'ADD_WANTED': {
@@ -1079,14 +1243,14 @@ export function applyIntent(robotId, intent, fromPlayerId) {
     case 'PATROL': {
       const inPrison = r.p.x > 50 && r.p.z < -48;
       r.waypoints = (inPrison ? [{ x: 58, z: -52 }, { x: 82, z: -52 }, { x: 82, z: -88 }, { x: 58, z: -88 }] : SQUARE_CORNERS).slice();
-      r.wpIndex = 0; r.fsm = 'PATROL';
+      r.wpIndex = 0; r.fsm = 'PATROL'; clearPath(r);
       setAction(r, 'patrolling');
       break;
     }
     case 'GUARD': {
       r.target = resolveMoveTarget(r, intent, from);
       if (!intent.params || (typeof intent.params.x !== 'number' && !intent.target)) r.target = { x: r.p.x, z: r.p.z };
-      r.fsm = 'GUARD';
+      r.fsm = 'GUARD'; clearPath(r);
       setAction(r, 'guarding');
       break;
     }
@@ -1107,7 +1271,7 @@ export function applyIntent(robotId, intent, fromPlayerId) {
       break;
     }
     case 'STOP': {
-      r.followId = null; r.target = null; r.fsm = 'IDLE'; r.stateTimer = 0;
+      r.followId = null; r.target = null; r.fsm = 'IDLE'; r.stateTimer = 0; clearPath(r);
       setAction(r, 'idle');
       break;
     }
@@ -1186,6 +1350,7 @@ export function applyWorldEvent(kind, data) {
 function setWallState(wallId, destroyed) {
   const w = state.walls.get(wallId);
   if (!w) return;
+  if (w.destroyed !== destroyed) nav.setWallDestroyed(wallId, destroyed);
   w.destroyed = destroyed;
   if (w.mesh) w.mesh.visible = !destroyed;
 }
@@ -1497,6 +1662,8 @@ function init() {
   window.G2049 = {
     state,
     bus,
+    nav: { findPath: nav.findPath, isWalkable: nav.isWalkable, hasLineOfWalk: nav.hasLineOfWalk },
+    manipulator: manipulatorInst,
     debugStep(seconds = STEP) {
       const steps = Math.max(1, Math.round(seconds / STEP));
       for (let i = 0; i < steps; i++) simStep();

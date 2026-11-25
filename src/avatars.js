@@ -12,7 +12,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as skeletonClone } from 'three/addons/utils/SkeletonUtils.js';
 
-const CLIP_FOR = { idle: 'idle', walk: 'walking', run: 'running', dance: 'dance', wave: 'wave', arrested: 'walking' };
+const CLIP_FOR = { idle: 'idle', walk: 'walking', run: 'running', dance: 'dance', wave: 'wave', arrested: 'walking', sitting: 'sitting', carried: 'sitting', death: 'death' };
 const TIMESCALE = { arrested: 0.5 };
 const FADE = 0.2;
 

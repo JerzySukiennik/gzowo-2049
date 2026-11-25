@@ -1,6 +1,6 @@
 // ai.js — single-model Gemini Live pipeline: one WebSocket session handles speech understanding, intent (robot_action tool) and native robot voice. Mic streaming in, PCM audio out, live subtitles, conversation-freeze signalling, speechSynthesis fallback for remote robot lines.
 import { GoogleGenAI, Modality, Type } from '@google/genai';
-import { bus, state, getNearestRobotId, getAIContext } from './game.js';
+import { bus, state, getNearestRobotId, getAIContext, colorNamePL } from './game.js';
 import { sendReq, broadcastRobotSay } from './multiplayer.js';
 import { sendChat } from './database.js';
 
@@ -13,11 +13,18 @@ const OUT_RATE = 24000;
 
 const SYSTEM_INSTRUCTION = [
   'You are the voice of the autonomous robots living in the cyber-city of "Gzowo 2049", a live multiplayer 3D game.',
-  'At any moment you speak AS ONE specific robot. Each turn a WORLD CONTEXT line tells you which robot you are (name, role, memory, surroundings) and who is talking to you. Stay fully in character as that robot.',
+  'At any moment you speak AS ONE specific robot. Each turn a WORLD CONTEXT line tells you which robot you are (name, role, memory, surroundings), the FULL ROSTER of every robot (name, role, color, current action, distance), and who is talking to you. Stay fully in character as that robot.',
   'You are powered by Google Gemini model gemini-3.1-flash-live-preview — if the player asks which AI, model, or language model you are, say exactly that.',
   'ALWAYS answer with a SHORT, natural spoken line in Polish (one or two sentences, in character). Technical terms may stay in English. Never read JSON, never describe your tools, never break character.',
   'When the player asks you to DO something in the world (move, follow, guard, patrol, destroy or repair a wall, arrest someone, add or remove a wanted status, dance, give or take an item, stop), you MUST call the robot_action tool with the right action, and also say a short spoken confirmation. If the player is only chatting, just speak.',
-  'Police robots can arrest and manage wanted lists; civilian robots cannot and should refuse such orders in character.'
+  'The player is the CITY OVERSEER — every robot obeys their commands. When a command addresses MORE THAN the robot you are voicing (e.g. "złapcie zielonych", "wszyscy tańczcie", "policja patrolujcie"), set the robot_action "robots" parameter to the right selector: "all", "police", "civilian", a color word (zielony/green, niebieski/blue, fioletowy/purple, żółty/yellow, pomarańczowy/orange, różowy/pink, czerwony/red, turkusowy/teal), or a comma-separated list of robot names. Omit "robots" when the command is only for you.',
+  'For police-only actions (ARREST / wanted) addressed with a civilian selector, the addressed civilians are the TARGETS to be arrested — the police units carry out the arrest. Civilian robots cannot personally arrest and should refuse if told to arrest with no fleet context.'
+].join(' ');
+
+const CHATTER_SYSTEM = [
+  'You script tiny ambient overheard exchanges between two autonomous robots in the cyber-city "Gzowo 2049".',
+  'Write a SHORT in-character micro-dialogue in Polish, 2 to 4 lines total, alternating between the two named robots. Keep each line under ~90 characters, natural and casual, reflecting their roles, current actions and any wanted list.',
+  'Respond with STRICT JSON ONLY: an array like [{"name":"VOX-7","line":"..."},{"name":"BAJT","line":"..."}]. No prose, no code fences, no extra keys.'
 ].join(' ');
 
 const TOOLS = [{
@@ -28,7 +35,8 @@ const TOOLS = [{
       type: Type.OBJECT,
       properties: {
         action: { type: Type.STRING, enum: ACTION_ENUM, description: 'The action to perform.' },
-        target: { type: Type.STRING, description: 'Target: a player or robot name, a place (main_square, prison), a wall id, or an item. Empty when not applicable.' },
+        target: { type: Type.STRING, description: 'Target: a player or robot name, a place (main_square, prison), a wall id, or an item. For a fleet ARREST this is the suspect(s) to arrest. Empty when not applicable.' },
+        robots: { type: Type.STRING, description: 'Optional fleet selector for WHO performs the action: "all", "police", "civilian", a color word (zielony/green, niebieski/blue, fioletowy/purple, żółty/yellow, pomarańczowy/orange, różowy/pink, czerwony/red, turkusowy/teal), or comma-separated robot names. Omit to address only the robot you are voicing.' },
         params: {
           type: Type.OBJECT,
           description: 'Optional extra parameters.',
@@ -70,6 +78,12 @@ let convRobotId = null;
 let convActive = false;
 let convOffTimer = null;
 const convReasons = { input: false, mic: false, reply: false };
+
+// When no robot is within earshot the overseer still commands the city: the reply
+// is voiced as "CITY-AI" (fallback TTS) instead of a robot's native audio.
+let cityAiMode = false;
+let cityCommandRid = null;
+let suppressNativeAudio = false;
 
 function status(text, level) {
   bus.dispatchEvent(new CustomEvent('ui:status', { detail: { text, level } }));
@@ -220,6 +234,7 @@ function ensurePlaybackCtx() {
 }
 
 function queueAudio(b64) {
+  if (suppressNativeAudio) return;
   const ctx = ensurePlaybackCtx();
   const bytes = base64ToBytes(b64);
   const samples = bytes.length >> 1;
@@ -290,10 +305,13 @@ function handleToolCall(fc) {
   const intent = {
     action,
     target: typeof args.target === 'string' ? args.target : '',
+    robots: typeof args.robots === 'string' ? args.robots : '',
     params: (args.params && typeof args.params === 'object') ? args.params : {},
     say: ''
   };
-  const robotId = convRobotId || getNearestRobotId(12);
+  // The host resolves any fleet selector; here we just need a sensible voicing/
+  // fallback robot id so single-robot commands still land.
+  const robotId = convRobotId || getNearestRobotId(40) || cityCommandRid || getNearestRobotId(1e9);
   if (robotId && action !== 'UNKNOWN') {
     sendReq('intent', { robotId, intent });
   }
@@ -307,7 +325,13 @@ function finishReply() {
   outputTranscriptBuf = '';
   inputTranscriptBuf = '';
   if (!text) return;
-  const rid = convRobotId || getNearestRobotId(12);
+  if (cityAiMode) {
+    showSubtitle('CITY-AI: ' + text, Math.max(3, text.length * 0.06));
+    bus.dispatchEvent(new CustomEvent('chat:incoming', { detail: { from: 'CITY-AI', text } }));
+    fallbackSpeak('CITY-AI', text);
+    return;
+  }
+  const rid = convRobotId || getNearestRobotId(40);
   const r = rid && state.robots.get ? state.robots.get(rid) : null;
   const name = r ? r.name : (rid || 'ROBOT');
   showSubtitle(name + ': ' + text, Math.max(3, text.length * 0.06));
@@ -319,21 +343,44 @@ function finishReply() {
   }
 }
 
+function buildRoster() {
+  const out = [];
+  if (!state.robots || !state.robots.values) return out;
+  for (const r of state.robots.values()) {
+    out.push({
+      name: r.name,
+      role: r.role,
+      color: colorNamePL(r.color),
+      action: r.currentAction,
+      dist: Math.round(robotDistanceToPlayer(r.id) || 999)
+    });
+  }
+  return out;
+}
+
 function contextHeader(rid) {
-  const r = state.robots.get ? state.robots.get(rid) : null;
-  const ctx = getAIContext(rid);
-  const name = r ? r.name : rid;
-  const role = r ? r.role : 'civilian';
+  const r = rid && state.robots.get ? state.robots.get(rid) : null;
+  const ctx = rid ? getAIContext(rid) : null;
+  const roster = buildRoster();
   const playerName = state.playerName || 'Gracz';
-  return 'WORLD CONTEXT: ' + JSON.stringify(ctx) + ' — you are now speaking AS robot ' + name + ' (' + role + '). Player ' + playerName + ' says:';
+  if (!r) {
+    return 'WORLD CONTEXT: ' + JSON.stringify({ roster, wanted: (state.wanted || []).slice() }) +
+      ' — no robot is within earshot; you answer AS the city overseer AI "CITY-AI". Commands still dispatch to the whole fleet. Overseer ' + playerName + ' says:';
+  }
+  const payload = Object.assign({}, ctx, { roster });
+  return 'WORLD CONTEXT: ' + JSON.stringify(payload) + ' — you are now speaking AS robot ' + r.name + ' (' + r.role + '). Overseer ' + playerName + ' says:';
 }
 
 async function handleTextUtterance(rawText, isRetry) {
   if (window.__AI_DEBUG) window.__AI_DEBUG.push('UTTER:' + rawText + (isRetry ? ' (retry)' : ''));
   const text = String(rawText || '').trim();
   if (!text) return;
-  const rid = convRobotId || getNearestRobotId(12);
-  if (!rid) { showSubtitle('Podejdź bliżej robota', 3); return; }
+  // No proximity gate: nearest robot within 40m voices the reply; beyond that the
+  // command still dispatches and the reply comes back as the CITY-AI overseer voice.
+  const rid = convRobotId || getNearestRobotId(40);
+  cityAiMode = !rid;
+  suppressNativeAudio = cityAiMode;
+  cityCommandRid = getNearestRobotId(1e9);
   convRobotId = rid;
   if (!isRetry) sendChat(state.lobbyId || currentLobbyId, state.playerName || 'Gracz', text);
   let s;
@@ -369,8 +416,11 @@ async function startMic() {
     status('Brak dostępu do mikrofonu', 'warn');
     return;
   }
-  const rid = convRobotId || getNearestRobotId(12);
-  if (rid) convRobotId = rid;
+  const rid = convRobotId || getNearestRobotId(40);
+  cityAiMode = !rid;
+  suppressNativeAudio = cityAiMode;
+  cityCommandRid = getNearestRobotId(1e9);
+  convRobotId = rid;
 
   micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: IN_RATE });
   if (micCtx.state === 'suspended') { try { await micCtx.resume(); } catch (e) {} }
@@ -397,9 +447,7 @@ async function startMic() {
   const btn = document.getElementById('mic-btn');
   if (btn) btn.classList.add('listening');
 
-  if (rid) {
-    try { s.sendClientContent({ turns: [{ role: 'user', parts: [{ text: contextHeader(rid) }] }], turnComplete: false }); } catch (e) {}
-  }
+  try { s.sendClientContent({ turns: [{ role: 'user', parts: [{ text: contextHeader(rid) }] }], turnComplete: false }); } catch (e) {}
   convReasons.mic = true;
   updateConversation();
 }
@@ -436,7 +484,7 @@ function updateConversation() {
   if (any) {
     if (convOffTimer) { clearTimeout(convOffTimer); convOffTimer = null; }
     if (!convActive) {
-      const rid = convRobotId || getNearestRobotId(12);
+      const rid = convRobotId || getNearestRobotId(40);
       if (!rid) return;
       convRobotId = rid;
       convActive = true;
@@ -475,6 +523,101 @@ function fallbackSpeak(robotName, text) {
   try { window.speechSynthesis.cancel(); window.speechSynthesis.speak(u); } catch (e) {}
 }
 
+export function isConversationActive() { return convActive; }
+
+// Voice one robot line locally (native per-robot TTS voice + subtitle + chat log)
+// and broadcast it to peers. Used by ambient robot-to-robot chatter (F1).
+export function speakRobotLine(robotId, text) {
+  const r = state.robots && state.robots.get ? state.robots.get(robotId) : null;
+  const name = r && r.name ? r.name : (robotId || 'ROBOT');
+  showSubtitle(name + ': ' + text, Math.max(3, text.length * 0.06));
+  bus.dispatchEvent(new CustomEvent('chat:incoming', { detail: { from: name, text } }));
+  fallbackSpeak(name, text);
+  markLocallySpoken(robotId + '|' + text);
+  broadcastRobotSay(robotId, text);
+}
+
+function chatterPrompt(payload) {
+  const w = (payload.wanted && payload.wanted.length) ? payload.wanted.map((n) => n.toUpperCase()).join(', ') : 'none';
+  return 'Two robots overheard in Gzowo 2049.\n' +
+    'Robot A: ' + payload.a.name + ' (' + payload.a.role + '), currently ' + payload.a.action + '. Recent: ' + payload.a.memory + '.\n' +
+    'Robot B: ' + payload.b.name + ' (' + payload.b.role + '), currently ' + payload.b.action + '. Recent: ' + payload.b.memory + '.\n' +
+    'Wanted list: ' + w + '.\n' +
+    'Write their short casual Polish exchange (2-4 lines) as strict JSON [{"name","line"}].';
+}
+
+function parseChatterJSON(rawText, payload) {
+  if (!rawText) return null;
+  let txt = String(rawText).trim();
+  const fence = txt.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) txt = fence[1].trim();
+  const start = txt.indexOf('['), end = txt.lastIndexOf(']');
+  if (start < 0 || end <= start) return null;
+  let arr;
+  try { arr = JSON.parse(txt.slice(start, end + 1)); } catch (e) { return null; }
+  if (!Array.isArray(arr) || !arr.length) return null;
+  const byName = new Map();
+  byName.set(payload.a.name.toLowerCase(), payload.a.id);
+  byName.set(payload.b.name.toLowerCase(), payload.b.id);
+  const out = [];
+  for (const item of arr) {
+    if (!item || typeof item.line !== 'string' || !item.line.trim()) continue;
+    const nm = String(item.name || '').trim();
+    const rid = byName.get(nm.toLowerCase()) || (out.length % 2 === 0 ? payload.a.id : payload.b.id);
+    const name = rid === payload.a.id ? payload.a.name : payload.b.name;
+    out.push({ robotId: rid, name, line: item.line.trim().slice(0, 140) });
+    if (out.length >= 4) break;
+  }
+  return out.length ? out : null;
+}
+
+// One-shot TEXT-only Live turn producing a 2-4 line Polish micro-dialogue between
+// two robots. Returns [{robotId,name,line}] or null on any failure (caller falls
+// back to canned lines). The session is opened and closed for this single turn.
+export async function generateChatter(payload) {
+  if (!payload || !payload.a || !payload.b) return null;
+  // payload carries robot ids for name->id mapping
+  payload.a.id = payload.a.id || null;
+  payload.b.id = payload.b.id || null;
+  let token;
+  try { token = await fetchToken(); } catch (e) { return null; }
+  let sess = null;
+  let buf = '';
+  let settled = false;
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const to = setTimeout(() => { if (!settled) { settled = true; reject(new Error('chatter timeout')); } }, 9000);
+      const g = new GoogleGenAI({ apiKey: token, httpOptions: { apiVersion: 'v1alpha' } });
+      g.live.connect({
+        model: MODEL,
+        config: { responseModalities: [Modality.TEXT], systemInstruction: CHATTER_SYSTEM },
+        callbacks: {
+          onmessage: (m) => {
+            const sc = m && m.serverContent;
+            if (!sc) return;
+            if (sc.modelTurn && sc.modelTurn.parts) {
+              for (const p of sc.modelTurn.parts) if (typeof p.text === 'string') buf += p.text;
+            }
+            if (sc.turnComplete && !settled) { settled = true; clearTimeout(to); resolve(buf); }
+          },
+          onerror: () => { if (!settled) { settled = true; clearTimeout(to); reject(new Error('chatter error')); } },
+          onclose: () => { if (!settled) { settled = true; clearTimeout(to); resolve(buf); } }
+        }
+      }).then((conn) => {
+        sess = conn;
+        try {
+          sess.sendClientContent({ turns: [{ role: 'user', parts: [{ text: chatterPrompt(payload) }] }], turnComplete: true });
+        } catch (e) { if (!settled) { settled = true; clearTimeout(to); reject(e); } }
+      }).catch((e) => { if (!settled) { settled = true; clearTimeout(to); reject(e); } });
+    });
+    try { sess && sess.close(); } catch (e) {}
+    return parseChatterJSON(result, payload);
+  } catch (e) {
+    try { sess && sess.close(); } catch (e2) {}
+    return null;
+  }
+}
+
 export function initAI() {
   bus.addEventListener('net:role', (e) => {
     const d = e.detail || {};
@@ -508,7 +651,7 @@ export function initAI() {
   const chatInput = document.getElementById('chat-input');
   if (chatInput) {
     chatInput.addEventListener('focus', () => {
-      const rid = getNearestRobotId(12);
+      const rid = getNearestRobotId(40);
       if (rid) convRobotId = rid;
       convReasons.input = true;
       updateConversation();

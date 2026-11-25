@@ -41,9 +41,27 @@ const MAX_REPLAN_FAILS = 3;
 const REPLANS_PER_STEP = 2;
 let replanBudget = 0;
 
-const CELL_POINTS = [
-  { x: 62, z: -78 }, { x: 66, z: -78 }, { x: 70, z: -78 }, { x: 74, z: -78 }, { x: 78, z: -78 }
-];
+// Four prison cells along the north wall (z=-88). Each is ~4x4m with three walls
+// (back + two sides) and an open south side facing the yard. Every cell wall is a
+// destructible wall (registered in state.walls + nav) so DESTROY_WALL breaks a
+// prisoner out. sit = interior seat point; mouth = the open side the robot enters.
+const CELLS = [60, 68, 76, 84].map((x, i) => ({
+  index: i,
+  sit: { x, z: -84 },
+  mouth: { x, z: -81 },
+  wallIds: ['wall_c' + (i + 1) + '_a', 'wall_c' + (i + 1) + '_b', 'wall_c' + (i + 1) + '_c']
+}));
+const CELL_WALL_DEFS = [];
+const CELL_WALL_INDEX = new Map();
+for (const c of CELLS) {
+  const x = c.sit.x;
+  CELL_WALL_DEFS.push(
+    { id: c.wallIds[0], x, z: -86, len: 4, h: 3, rot: 0 },
+    { id: c.wallIds[1], x: x - 2, z: -84, len: 4, h: 3, rot: Math.PI / 2 },
+    { id: c.wallIds[2], x: x + 2, z: -84, len: 4, h: 3, rot: Math.PI / 2 }
+  );
+  for (const wid of c.wallIds) CELL_WALL_INDEX.set(wid, c.index);
+}
 const GATE_WP = { x: 70, z: -52 };
 
 const SQUARE_CORNERS = [
@@ -97,7 +115,7 @@ const WALL_DEFS = [
   { id: 'wall_st_10', x: -70, z: 14, len: 8, h: 2.5, rot: Math.PI / 2 },
   { id: 'wall_st_11', x: 56, z: -42, len: 8, h: 2.5, rot: 0 },
   { id: 'wall_st_12', x: -42, z: 56, len: 8, h: 2.5, rot: Math.PI / 2 }
-];
+].concat(CELL_WALL_DEFS);
 
 let renderer, scene, camera, dirLight;
 let playerMesh;
@@ -121,6 +139,9 @@ const cellOccupied = new Set();
 let cellRR = 0;
 let playerArrest = null;
 
+const chatterRng = mulberry32(0xC4A77E5);
+const chatter = { acc: 0, next: 45 + 0xC4A7 % 30, active: null };
+
 function mulberry32(a) {
   return function () {
     a |= 0; a = (a + 0x6D2B79F5) | 0;
@@ -133,6 +154,82 @@ function mulberry32(a) {
 function el(id) { return document.getElementById(id); }
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function dist2(ax, az, bx, bz) { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
+
+// --- color name / selector resolution (fleet commands) ---------------------
+const COLOR_PL = {
+  red: 'czerwony', orange: 'pomarańczowy', yellow: 'żółty', green: 'zielony',
+  teal: 'turkusowy', blue: 'niebieski', purple: 'fioletowy', pink: 'różowy',
+  gray: 'szary', white: 'biały'
+};
+// selector words (PL + EN, with and without diacritics) -> canonical bucket.
+const COLOR_WORDS = {
+  czerwony: 'red', czerwoni: 'red', red: 'red',
+  pomaranczowy: 'orange', 'pomarańczowy': 'orange', orange: 'orange',
+  zolty: 'yellow', 'żółty': 'yellow', yellow: 'yellow',
+  zielony: 'green', zieloni: 'green', zielonych: 'green', green: 'green', greens: 'green',
+  turkusowy: 'teal', teal: 'teal', cyan: 'teal',
+  niebieski: 'blue', niebiescy: 'blue', niebieskich: 'blue', blue: 'blue', blues: 'blue',
+  fioletowy: 'purple', purple: 'purple',
+  rozowy: 'pink', 'różowy': 'pink', pink: 'pink',
+  szary: 'gray', gray: 'gray', grey: 'gray',
+  bialy: 'white', 'biały': 'white', white: 'white'
+};
+// green and teal robots read as each other in casual speech ("złap zielonych").
+const COLOR_EQUIV = { green: ['green', 'teal'], teal: ['teal', 'green'] };
+
+function stripDia(s) {
+  return s.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/ł/g, 'l');
+}
+
+function colorBucket(hex) {
+  const c = new THREE.Color(hex);
+  const hsl = { h: 0, s: 0, l: 0 };
+  c.getHSL(hsl);
+  const h = hsl.h * 360;
+  if (hsl.l > 0.9 && hsl.s < 0.2) return 'white';
+  if (hsl.s < 0.18) return 'gray';
+  if (h < 15 || h >= 345) return 'red';
+  if (h < 40) return 'orange';
+  if (h < 70) return 'yellow';
+  if (h < 160) return 'green';
+  if (h < 200) return 'teal';
+  if (h < 255) return 'blue';
+  if (h < 300) return 'purple';
+  return 'pink';
+}
+
+export function colorNamePL(hex) { return COLOR_PL[colorBucket(hex)] || 'nieznany'; }
+
+function roleIds(role) {
+  const out = [];
+  for (const r of state.robots.values()) if (r.role === role) out.push(r.id);
+  return out;
+}
+
+// Resolve a fleet-command selector string to a list of robot ids. Empty selector
+// falls back to the single robot being spoken to. Host-authoritative — clients
+// never resolve locally, they forward the raw selector inside the intent.
+export function resolveSelector(selector, speakerId) {
+  const raw = (selector == null ? '' : String(selector)).trim().toLowerCase();
+  if (!raw) return speakerId ? [speakerId] : [];
+  if (raw === 'all' || raw === 'wszyscy' || raw === 'wszystkie' || raw === 'everyone') return [...state.robots.keys()];
+  if (raw === 'police' || raw === 'policja' || raw === 'policjanci' || raw === 'straz' || raw === 'straż') return roleIds('police');
+  if (raw === 'civilian' || raw === 'civilians' || raw === 'cywile' || raw === 'cywil' || raw === 'cywilni') return roleIds('civilian');
+  const bucket = COLOR_WORDS[raw] || COLOR_WORDS[stripDia(raw)];
+  if (bucket) {
+    const accept = COLOR_EQUIV[bucket] || [bucket];
+    const out = [];
+    for (const r of state.robots.values()) if (accept.includes(colorBucket(r.color))) out.push(r.id);
+    return out;
+  }
+  const names = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  for (const nm of names) {
+    for (const r of state.robots.values()) if (r.name.toLowerCase() === nm) out.push(r.id);
+  }
+  if (out.length) return [...new Set(out)];
+  return speakerId ? [speakerId] : [];
+}
 
 function status(text, level) {
   bus.dispatchEvent(new CustomEvent('ui:status', { detail: { text, level: level || 'ok' } }));
@@ -292,14 +389,6 @@ function buildSquare() {
 
 function buildPrison() {
   const mat = new THREE.MeshStandardMaterial({ color: 0x14141c, roughness: 1 });
-  const cellMat = new THREE.MeshStandardMaterial({ color: 0x1e1e28, roughness: 0.95 });
-  for (let i = 0; i < 4; i++) {
-    const cell = new THREE.Mesh(new THREE.BoxGeometry(6, 3, 5), cellMat);
-    cell.position.set(58 + i * 8, 1.5, -84);
-    cell.castShadow = true;
-    cell.receiveShadow = true;
-    scene.add(cell);
-  }
   for (const px of [64, 76]) {
     const post = new THREE.Mesh(new THREE.BoxGeometry(1.2, 4.5, 1.2), mat);
     post.position.set(px, 2.25, -52);
@@ -390,6 +479,7 @@ function buildRobots() {
       speed: police ? 4.5 : 3.5,
       fsm: duty.fsm, target: duty.target, waypoints: duty.waypoints, wpIndex: 0,
       followId: null, escortId: null, escortWps: null, escortIndex: 0, captorId: null, cellIndex: -1,
+      chatFaceId: null, chatAnim: null,
       inventory: [], memory: [], currentAction: 'idle',
       stateTimer: 0, scanTimer: 0, danceT: 0,
       dutyFsm: duty.fsm, dutyWaypoints: duty.waypoints, dutyTarget: duty.target,
@@ -638,12 +728,46 @@ function nameToEntity(lowerName) {
 }
 
 function assignCell() {
-  for (let i = 0; i < CELL_POINTS.length; i++) {
+  for (let i = 0; i < CELLS.length; i++) {
     if (!cellOccupied.has(i)) { cellOccupied.add(i); return i; }
   }
-  const i = cellRR % CELL_POINTS.length;
+  const i = cellRR % CELLS.length;
   cellRR++;
   return i;
+}
+
+// Nearest free cell mouth for the Manipulator to drop a robot into. Null = full.
+function pickDropCellMouth() {
+  let best = null, bestD = Infinity;
+  for (const c of CELLS) {
+    if (cellOccupied.has(c.index)) continue;
+    const d = dist2(GATE_WP.x, GATE_WP.z, c.mouth.x, c.mouth.z);
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return best ? { x: best.mouth.x, z: best.mouth.z, index: best.index } : null;
+}
+
+function jailRobotInCell(r, cellIndex, memoryEntry) {
+  cellOccupied.add(cellIndex);
+  r.cellIndex = cellIndex;
+  r.captorId = null; r.heldY = 0;
+  r.fsm = 'JAILED';
+  clearPath(r);
+  setAction(r, 'jailed', memoryEntry || ('Locked in cell ' + (cellIndex + 1)));
+}
+
+function freeJailed(r, memoryEntry) {
+  if (r.cellIndex >= 0) cellOccupied.delete(r.cellIndex);
+  r.cellIndex = -1; r.heldY = 0;
+  r.fsm = 'WANDER';
+  pickWander(r);
+  setAction(r, 'on the loose', memoryEntry || 'Left the cell');
+}
+
+function freePrisonersOfCell(cellIndex) {
+  for (const r of state.robots.values()) {
+    if (r.fsm === 'JAILED' && r.cellIndex === cellIndex) freeJailed(r, 'Escaped through a broken cell wall');
+  }
 }
 
 function resumeDuty(r) {
@@ -661,7 +785,8 @@ function setConversation(active, robotId) {
   const r = state.robots.get(robotId);
   if (!r) return;
   if (active) {
-    if (r.fsm === 'CONVERSING' || r.fsm === 'ESCORT' || r.fsm === 'ARRESTED' || r.fsm === 'CHASE') return;
+    if (r.fsm === 'CONVERSING' || r.fsm === 'ESCORT' || r.fsm === 'CARRIED' ||
+        r.fsm === 'JAILED' || r.fsm === 'CHASE' || r.fsm === 'HELD') return;
     r.prevFsm = r.fsm;
     r.prevTarget = r.target;
     r.prevWaypoints = r.waypoints;
@@ -670,6 +795,8 @@ function setConversation(active, robotId) {
     r.anim = 'idle';
   } else {
     if (r.fsm !== 'CONVERSING') return;
+    r.chatFaceId = null;
+    r.chatAnim = null;
     if (r.prevFsm && r.prevFsm !== 'CONVERSING') {
       r.fsm = r.prevFsm;
       r.target = r.prevTarget;
@@ -704,7 +831,7 @@ function setAction(r, action, memoryEntry) {
 function updateRobot(r) {
   r.stateTimer += STEP;
   const police = r.role === 'police';
-  if (police && r.fsm !== 'CHASE' && r.fsm !== 'ESCORT' && r.fsm !== 'CONVERSING' && r.fsm !== 'ARRESTED' && r.fsm !== 'HELD') {
+  if (police && r.fsm !== 'CHASE' && r.fsm !== 'ESCORT' && r.fsm !== 'CONVERSING' && r.fsm !== 'CARRIED' && r.fsm !== 'JAILED' && r.fsm !== 'HELD') {
     r.scanTimer += STEP;
     if (r.scanTimer >= 2) {
       r.scanTimer = 0;
@@ -798,10 +925,12 @@ function updateRobot(r) {
       break;
     }
     case 'CHASE': {
-      // Bail if the quarry got grabbed by the Manipulator — chasing/arresting a
-      // robot pinned in the gripper would fight updateHeld() for the FSM.
+      // Bail if the quarry got grabbed by the Manipulator, carried off by another
+      // officer, or already jailed — fighting those states for the FSM breaks them.
       const followed = state.robots.get(r.followId);
-      if (followed && followed.fsm === 'HELD') { r.fsm = 'IDLE'; r.followId = null; clearPath(r); break; }
+      if (followed && (followed.fsm === 'HELD' || followed.fsm === 'CARRIED' || followed.fsm === 'JAILED')) {
+        r.fsm = 'IDLE'; r.followId = null; clearPath(r); break;
+      }
       const tp = entityPos(r.followId);
       if (!tp) { r.fsm = 'IDLE'; r.followId = null; clearPath(r); break; }
       const d = robotFollow(r, tp.x, tp.z, r.speed);
@@ -813,19 +942,34 @@ function updateRobot(r) {
       escortStep(r);
       break;
     }
-    case 'ARRESTED': {
+    case 'CARRIED': {
+      // Hard-attached to the captor: lifted, held out front, no ground shuffle.
       const cap = state.robots.get(r.captorId);
-      if (!cap) { r.fsm = 'WANDER'; pickWander(r); break; }
-      const dx = cap.p.x - r.p.x, dz = cap.p.z - r.p.z;
-      const d = Math.hypot(dx, dz);
-      if (d > 4) { r.p.x = cap.p.x - (dx / d) * 2.5; r.p.z = cap.p.z - (dz / d) * 2.5; }
-      else if (d > 2.5) seek(r, cap.p.x - (dx / d) * 2.5, cap.p.z - (dz / d) * 2.5, r.speed);
-      r.anim = 'arrested';
+      if (!cap || cap.fsm !== 'ESCORT') { r.captorId = null; r.heldY = 0; r.fsm = 'WANDER'; pickWander(r); break; }
+      const fx = Math.sin(cap.ry), fz = Math.cos(cap.ry);
+      r.p.x = cap.p.x + fx * 0.9;
+      r.p.z = cap.p.z + fz * 0.9;
+      r.heldY = 0.6;
+      r.ry = cap.ry;
+      r.anim = 'sitting';
+      break;
+    }
+    case 'JAILED': {
+      const cell = CELLS[r.cellIndex];
+      if (!cell) { r.fsm = 'WANDER'; pickWander(r); break; }
+      const d = robotFollow(r, cell.sit.x, cell.sit.z, r.speed);
+      if (d <= SEEK_ARRIVE || r.navArrived) {
+        r.p.x = cell.sit.x; r.p.z = cell.sit.z; r.ry = 0; r.anim = 'sitting'; clearPath(r);
+      } else {
+        r.anim = 'walk';
+      }
       break;
     }
     case 'CONVERSING': {
-      r.ry = Math.atan2(state.player.p.x - r.p.x, state.player.p.z - r.p.z);
-      r.anim = 'idle';
+      let tx = state.player.p.x, tz = state.player.p.z;
+      if (r.chatFaceId) { const o = state.robots.get(r.chatFaceId); if (o) { tx = o.p.x; tz = o.p.z; } }
+      r.ry = Math.atan2(tx - r.p.x, tz - r.p.z);
+      r.anim = r.chatAnim || 'idle';
       break;
     }
     case 'HELD': {
@@ -862,9 +1006,9 @@ function policeScan(r) {
   for (const [id, rp] of state.remotePlayers) check(rp.name || id, id, rp.p.x, rp.p.z);
   for (const t of state.robots.values()) {
     if (t.id === r.id) continue;
-    // Skip robots the Manipulator has grabbed — they're pinned in the gripper
-    // and their wanted flag clears at grab time; don't send police after them.
-    if (t.fsm === 'HELD') continue;
+    // Skip robots that are already grabbed, being carried, or jailed — sending
+    // police after them fights the state that already has them.
+    if (t.fsm === 'HELD' || t.fsm === 'CARRIED' || t.fsm === 'JAILED') continue;
     check(t.name, t.id, t.p.x, t.p.z);
   }
   return best;
@@ -873,15 +1017,16 @@ function policeScan(r) {
 function doArrest(officer, targetId) {
   const cell = assignCell();
   officer.cellIndex = cell;
-  const cp = CELL_POINTS[cell];
-  officer.escortWps = [GATE_WP, cp];
+  officer.escortWps = [GATE_WP, CELLS[cell].mouth];
   officer.escortIndex = 0;
   officer.fsm = 'ESCORT';
   clearPath(officer);
   const tRobot = state.robots.get(targetId);
   if (tRobot) {
-    tRobot.fsm = 'ARRESTED';
+    tRobot.fsm = 'CARRIED';
     tRobot.captorId = officer.id;
+    tRobot.heldY = 0.6;
+    clearPath(tRobot);
     officer.escortId = targetId;
     setAction(officer, 'escorting ' + tRobot.name + ' to prison', 'Arrested ' + tRobot.name);
   } else {
@@ -923,28 +1068,24 @@ function dragPlayer(playerId, officer) {
 }
 
 function finishEscort(officer, prisonerId) {
-  const cp = CELL_POINTS[officer.cellIndex];
+  const cellIndex = officer.cellIndex;
+  let keepCell = false;
   if (officer.escortId && !prisonerId) {
     const prisoner = state.robots.get(officer.escortId);
     if (prisoner) {
-      prisoner.spawn = { x: cp.x, z: -70 };
-      prisoner.p.x = cp.x; prisoner.p.z = cp.z;
-      prisoner.captorId = null;
-      prisoner.fsm = 'WANDER';
-      pickWander(prisoner);
-      const list = state.wanted.filter((n) => n !== prisoner.name.toLowerCase());
-      if (list.length !== state.wanted.length) applyWorldEvent('wanted', { list });
+      jailRobotInCell(prisoner, cellIndex, 'Locked in a cell by ' + officer.name);
+      keepCell = true; // ownership of the reserved cell transfers to the prisoner
       setAction(officer, 'on duty', 'Escorted ' + prisoner.name + ' to prison');
     }
   } else if (prisonerId) {
     if (playerArrest && playerArrest.playerId === prisonerId) {
       playerArrest.phase = 'jailed';
       playerArrest.timer = 20;
-      playerArrest.cell = cp;
+      playerArrest.cell = CELLS[cellIndex] ? CELLS[cellIndex].sit : GATE_WP;
     }
     setAction(officer, 'on duty', 'Jailed a suspect');
   }
-  cellOccupied.delete(officer.cellIndex);
+  if (!keepCell && cellIndex >= 0) cellOccupied.delete(cellIndex);
   officer.escortId = null; officer.escortWps = null; officer.cellIndex = -1;
   resumeDuty(officer);
 }
@@ -987,7 +1128,11 @@ function initManipulator() {
     base: { x: 73, z: -48 },
     gate: { x: GATE_WP.x, z: GATE_WP.z },
     palette: { body: 0x2a2a34, metal: 0x14141c, joint: 0x3a3a46, accent: ACCENT, alert: ALERT },
-    hooks: { setAction, handOffEscort, jailRobotInYard, syncRobotMesh, clearWanted }
+    hooks: {
+      setAction, handOffEscort, jailRobotInYard, syncRobotMesh, clearWanted,
+      pickDropCell: pickDropCellMouth,
+      jailRobotInCell: (r, idx) => jailRobotInCell(r, idx, 'Dropped into a cell by the Manipulator')
+    }
   });
 }
 
@@ -1021,6 +1166,138 @@ function updatePlayerArrest() {
       playerArrest = null;
     }
   }
+}
+
+// --- F1: ambient robot-to-robot chatter ------------------------------------
+const CHATTER_ELIGIBLE = new Set(['IDLE', 'WANDER', 'PATROL']);
+
+function chatterEligible(r) { return CHATTER_ELIGIBLE.has(r.fsm); }
+
+function pickChatterPair() {
+  if (ai.isConversationActive && ai.isConversationActive()) return null;
+  const p = state.player.p;
+  const near = [];
+  for (const r of state.robots.values()) {
+    if (!chatterEligible(r)) continue;
+    if (dist2(r.p.x, r.p.z, p.x, p.z) > 35 * 35) continue;
+    near.push(r);
+  }
+  for (let i = 0; i < near.length; i++) {
+    for (let j = i + 1; j < near.length; j++) {
+      if (dist2(near[i].p.x, near[i].p.z, near[j].p.x, near[j].p.z) <= 10 * 10) return [near[i], near[j]];
+    }
+  }
+  return null;
+}
+
+function freezeForChatter(r, faceId) {
+  if (r.fsm === 'CONVERSING') return;
+  r.prevFsm = r.fsm;
+  r.prevTarget = r.target;
+  r.prevWaypoints = r.waypoints;
+  r.prevWpIndex = r.wpIndex;
+  r.fsm = 'CONVERSING';
+  r.chatFaceId = faceId;
+  r.chatAnim = 'idle';
+  r.anim = 'idle';
+  clearPath(r);
+}
+
+function chatterMemoryContext(r) {
+  const mem = r.memory.slice(-4);
+  return mem.length ? mem.join(' | ') : 'nothing notable';
+}
+
+function buildChatterPayload(a, b) {
+  return {
+    a: { id: a.id, name: a.name, role: a.role, action: a.currentAction, memory: chatterMemoryContext(a) },
+    b: { id: b.id, name: b.name, role: b.role, action: b.currentAction, memory: chatterMemoryContext(b) },
+    wanted: state.wanted.slice()
+  };
+}
+
+function cannedChatter(a, b) {
+  const wanted = state.wanted.length ? state.wanted.map((n) => n.toUpperCase()).join(', ') : null;
+  const pools = wanted ? [
+    [{ r: a, t: 'Słyszałeś? ' + wanted + ' na liście gończej.' }, { r: b, t: 'Trzymam się od tego z daleka.' }],
+    [{ r: a, t: 'Patrole ostre dzisiaj przez tych poszukiwanych.' }, { r: b, t: 'Byle nie skończyć w celi.' }],
+    [{ r: b, t: 'Widziałeś kogoś z listy?' }, { r: a, t: 'Na razie spokój, ale czujność się przydaje.' }]
+  ] : [
+    [{ r: a, t: 'Znowu ten neonowy zmierzch nad Gzowem.' }, { r: b, t: 'Nigdy się nie znudzi, przyznaję.' }],
+    [{ r: b, t: 'Bateria trzyma? Mnie spada za szybko.' }, { r: a, t: 'Dolej sobie na stacji przy rynku.' }],
+    [{ r: a, t: 'Cisza dziś na ulicach.' }, { r: b, t: 'Lubię takie zmiany, bez nerwów.' }],
+    [{ r: b, t: 'Ten Manipulator znów kogoś złapał.' }, { r: a, t: 'Lepiej nie podchodzić za blisko bramy.' }]
+  ];
+  const pick = pools[Math.floor(chatterRng() * pools.length)] || pools[0];
+  return pick.map((ln) => ({ robotId: ln.r.id, name: ln.r.name, line: ln.t }));
+}
+
+function startChatter(pair) {
+  const [a, b] = pair;
+  const session = { a: a.id, b: b.id, lines: null, idx: -1, timer: 0, holdFor: 3, phase: 'load' };
+  chatter.active = session;
+  freezeForChatter(a, b.id);
+  freezeForChatter(b, a.id);
+  const payload = buildChatterPayload(a, b);
+  const gen = ai.generateChatter ? ai.generateChatter(payload) : Promise.resolve(null);
+  gen.then((lines) => {
+    if (chatter.active !== session || session.lines) return;
+    session.lines = (lines && lines.length) ? lines : cannedChatter(a, b);
+  }).catch(() => {
+    if (chatter.active === session && !session.lines) session.lines = cannedChatter(a, b);
+  });
+}
+
+function playChatterLine(session) {
+  const line = session.lines[session.idx];
+  const a = state.robots.get(session.a), b = state.robots.get(session.b);
+  if (a) a.chatAnim = 'idle';
+  if (b) b.chatAnim = 'idle';
+  const speaker = state.robots.get(line.robotId);
+  if (!speaker) { session.holdFor = 0.1; return; }
+  if (session.idx === 0) speaker.chatAnim = 'wave';
+  session.holdFor = Math.max(2.4, line.line.length * 0.07);
+  const other = speaker.id === session.a ? b : a;
+  speaker.memory.push('Told ' + (other ? other.name : 'a neighbour') + ': ' + line.line);
+  if (speaker.memory.length > 20) speaker.memory = speaker.memory.slice(-20);
+  if (ai.speakRobotLine) ai.speakRobotLine(line.robotId, line.line);
+}
+
+function endChatter(session) {
+  chatter.active = null;
+  for (const id of [session.a, session.b]) {
+    const r = state.robots.get(id);
+    if (r) { r.chatAnim = null; setConversation(false, id); }
+  }
+}
+
+function updateChatter(dt) {
+  if (state.mode !== 'host' && state.mode !== 'solo') return;
+  const session = chatter.active;
+  if (session) {
+    session.timer += dt;
+    if (session.phase === 'load') {
+      if (session.lines) { session.phase = 'play'; session.timer = session.holdFor; }
+      else if (session.timer > 6) { session.lines = cannedChatter(state.robots.get(session.a), state.robots.get(session.b)); session.phase = 'play'; session.timer = session.holdFor; }
+      // if either robot got pulled out of the freeze (arrest etc.), abandon
+      const ra = state.robots.get(session.a), rb = state.robots.get(session.b);
+      if (!ra || !rb || ra.fsm !== 'CONVERSING' || rb.fsm !== 'CONVERSING') endChatter(session);
+      return;
+    }
+    if (session.timer >= session.holdFor) {
+      session.idx++;
+      if (!session.lines || session.idx >= session.lines.length) { endChatter(session); return; }
+      playChatterLine(session);
+      session.timer = 0;
+    }
+    return;
+  }
+  chatter.acc += dt;
+  if (chatter.acc < chatter.next) return;
+  chatter.acc = 0;
+  chatter.next = 45 + chatterRng() * 30;
+  const pair = pickChatterPair();
+  if (pair) startChatter(pair);
 }
 
 function lerpEntities() {
@@ -1091,6 +1368,7 @@ function simStep() {
     replanBudget = REPLANS_PER_STEP;
     for (const r of state.robots.values()) updateRobot(r);
     updatePlayerArrest();
+    updateChatter(STEP);
   } else if (state.mode === 'client') {
     updatePlayer();
   }
@@ -1187,11 +1465,113 @@ function findNearestWall(x, z, wantDestroyed) {
   return best;
 }
 
+function idToName(id) {
+  const r = state.robots.get(id);
+  if (r) return r.name;
+  if (id === (state.playerId || 'solo')) return state.playerName;
+  const rp = state.remotePlayers.get(id);
+  if (rp) return rp.name || id;
+  return id;
+}
+
+// Distribute arrest targets among police units: each target grabbed by the nearest
+// still-free unit, then round-robin once units run out.
+function assignArrests(unitIds, targetIds) {
+  const units = unitIds.map((id) => state.robots.get(id)).filter(Boolean);
+  if (!units.length) return;
+  const free = units.slice();
+  let rr = 0;
+  for (const tid of targetIds) {
+    const tp = entityPos(tid);
+    if (!tp) continue;
+    let unit = null;
+    if (free.length) {
+      let bi = 0, bd = Infinity;
+      for (let i = 0; i < free.length; i++) {
+        const d = dist2(free[i].p.x, free[i].p.z, tp.x, tp.z);
+        if (d < bd) { bd = d; bi = i; }
+      }
+      unit = free.splice(bi, 1)[0];
+    } else {
+      unit = units[rr++ % units.length];
+    }
+    unit.fsm = 'CHASE'; unit.followId = tid; clearPath(unit);
+    setAction(unit, 'chasing ' + idToName(tid));
+  }
+}
+
+// Fleet arrest: the selector may address the victims (civilians/players) and/or the
+// police units. Everyone targeted becomes wanted; police units then distribute.
+function applyFleetArrest(intent, ids) {
+  let targetIds = [];
+  const nonPolice = ids.filter((id) => { const r = state.robots.get(id); return r && r.role !== 'police'; });
+  const policeSel = ids.filter((id) => { const r = state.robots.get(id); return r && r.role === 'police'; });
+  if (nonPolice.length && !policeSel.length) targetIds = nonPolice.slice();
+  if (intent.target) {
+    const t = String(intent.target).toLowerCase();
+    const ent = nameToEntity(t);
+    if (ent) targetIds.push(ent.id);
+    else targetIds.push(...resolveSelector(intent.target, null));
+  }
+  targetIds = [...new Set(targetIds)];
+  if (!targetIds.length) return;
+  const list = state.wanted.slice();
+  for (const tid of targetIds) { const nm = idToName(tid).toLowerCase(); if (nm && !list.includes(nm)) list.push(nm); }
+  if (list.length !== state.wanted.length) applyWorldEvent('wanted', { list });
+  assignArrests(policeSel.length ? policeSel : roleIds('police'), targetIds);
+}
+
+// ADD_WANTED / REMOVE_WANTED resolved once at world level (not per robot).
+function applyWantedIntent(action, intent, ids, hasSelector) {
+  const names = new Set();
+  if (intent.target) {
+    const t = String(intent.target).toLowerCase();
+    const ent = nameToEntity(t);
+    if (ent) names.add(idToName(ent.id).toLowerCase());
+    else {
+      const sub = resolveSelector(intent.target, null);
+      if (sub.length) for (const id of sub) names.add(state.robots.get(id).name.toLowerCase());
+      else names.add(t);
+    }
+  }
+  if (hasSelector) for (const id of ids) { const r = state.robots.get(id); if (r) names.add(r.name.toLowerCase()); }
+  if (!names.size) return;
+  if (action === 'ADD_WANTED') {
+    const list = state.wanted.slice();
+    for (const n of names) if (!list.includes(n)) list.push(n);
+    applyWorldEvent('wanted', { list });
+  } else {
+    applyWorldEvent('wanted', { list: state.wanted.filter((n) => !names.has(n)) });
+    for (const n of names) {
+      const ent = nameToEntity(n);
+      const t = ent && ent.kind === 'robot' ? state.robots.get(ent.id) : null;
+      if (t && t.fsm === 'JAILED') freeJailed(t, 'Released — no longer wanted');
+      else if (t && t.fsm === 'CARRIED') { t.captorId = null; t.heldY = 0; t.fsm = 'WANDER'; pickWander(t); }
+    }
+  }
+}
+
 export function applyIntent(robotId, intent, fromPlayerId) {
   if (state.mode !== 'host' && state.mode !== 'solo') return;
-  const r = state.robots.get(robotId);
-  if (!r || !intent) return;
+  if (!intent) return;
   const from = fromPlayerId || state.playerId || 'solo';
+  const action = intent.action || 'UNKNOWN';
+  const hasSelector = !!(intent.robots != null && String(intent.robots).trim());
+  const ids = resolveSelector(intent.robots, robotId);
+
+  if (action === 'ARREST') {
+    if (hasSelector) applyFleetArrest(intent, ids);
+    else { const r = state.robots.get(robotId); if (r) applyIntentToRobot(r, intent, from); }
+  } else if (action === 'ADD_WANTED' || action === 'REMOVE_WANTED') {
+    applyWantedIntent(action, intent, ids, hasSelector);
+  } else {
+    for (const id of ids) { const r = state.robots.get(id); if (r) applyIntentToRobot(r, intent, from); }
+  }
+
+  if (intent.say && intent.say.length) multiplayer.broadcastRobotSay(robotId, intent.say);
+}
+
+function applyIntentToRobot(r, intent, from) {
   const action = intent.action || 'UNKNOWN';
 
   switch (action) {
@@ -1237,7 +1617,8 @@ export function applyIntent(robotId, intent, fromPlayerId) {
       applyWorldEvent('wanted', { list: state.wanted.filter((n) => n !== name) });
       const ent = nameToEntity(name);
       const t = ent && ent.kind === 'robot' ? state.robots.get(ent.id) : null;
-      if (t && t.fsm === 'ARRESTED') { t.captorId = null; t.fsm = 'WANDER'; pickWander(t); }
+      if (t && t.fsm === 'JAILED') freeJailed(t, 'Released — no longer wanted');
+      else if (t && t.fsm === 'CARRIED') { t.captorId = null; t.heldY = 0; t.fsm = 'WANDER'; pickWander(t); }
       break;
     }
     case 'PATROL': {
@@ -1276,10 +1657,6 @@ export function applyIntent(robotId, intent, fromPlayerId) {
       break;
     }
     default: break;
-  }
-
-  if (intent.say && intent.say.length) {
-    multiplayer.broadcastRobotSay(robotId, intent.say);
   }
 }
 
@@ -1350,9 +1727,14 @@ export function applyWorldEvent(kind, data) {
 function setWallState(wallId, destroyed) {
   const w = state.walls.get(wallId);
   if (!w) return;
-  if (w.destroyed !== destroyed) nav.setWallDestroyed(wallId, destroyed);
+  const changed = w.destroyed !== destroyed;
+  if (changed) nav.setWallDestroyed(wallId, destroyed);
   w.destroyed = destroyed;
   if (w.mesh) w.mesh.visible = !destroyed;
+  // Breaking any wall of a cell frees whoever is jailed inside it (host authority).
+  if (changed && destroyed && (state.mode === 'host' || state.mode === 'solo') && CELL_WALL_INDEX.has(wallId)) {
+    freePrisonersOfCell(CELL_WALL_INDEX.get(wallId));
+  }
 }
 
 function refreshWanted() {

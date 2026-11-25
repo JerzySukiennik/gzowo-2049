@@ -167,8 +167,8 @@ export function init(opts) {
   function findTarget() {
     let best = null, bestD = DETECT * DETECT;
     for (const r of robots().values()) {
-      if (r.fsm === 'HELD') continue;
-      if (!isWanted(r) && r.fsm !== 'ARRESTED') continue;
+      if (r.fsm === 'HELD' || r.fsm === 'JAILED') continue;
+      if (!isWanted(r) && r.fsm !== 'CARRIED') continue;
       const d = dist2(r.p.x, r.p.z, GATE.x, GATE.z);
       if (d < bestD) { bestD = d; best = r; }
     }
@@ -176,12 +176,14 @@ export function init(opts) {
   }
 
   function stillTarget(r) {
-    if (!r || r.fsm === 'HELD') return false;
-    if (!isWanted(r) && r.fsm !== 'ARRESTED') return false;
+    if (!r || r.fsm === 'HELD' || r.fsm === 'JAILED') return false;
+    if (!isWanted(r) && r.fsm !== 'CARRIED') return false;
     return dist2(r.p.x, r.p.z, GATE.x, GATE.z) < LEASH * LEASH;
   }
 
   function findDropCell() {
+    // Prefer the nearest free prison cell mouth (host owns cell occupancy).
+    if (hooks.pickDropCell) { const c = hooks.pickDropCell(); if (c) return c; }
     for (const c of DROP_PREF) if (nav.isWalkable(c.x, c.z)) return c;
     for (let i = 0; i < 40; i++) {
       const x = YARD.minX + Math.random() * (YARD.maxX - YARD.minX);
@@ -192,7 +194,7 @@ export function init(opts) {
   }
 
   function enterGrab(r) {
-    if (r.fsm === 'ARRESTED' && r.captorId) {
+    if (r.fsm === 'CARRIED' && r.captorId) {
       const officer = robots().get(r.captorId);
       if (officer && hooks.handOffEscort) hooks.handOffEscort(officer);
     }
@@ -200,9 +202,8 @@ export function init(opts) {
     r.fsm = 'HELD';
     r.anim = 'arrested';
     if (r.heldY === undefined) r.heldY = 0;
-    // Drop the wanted flag now (not later in jailRobotInYard) so no police unit
-    // targets or keeps chasing the robot while it's pinned in the gripper.
-    if (hooks.clearWanted) hooks.clearWanted(r);
+    // Robot stays wanted while pinned — the HELD/JAILED states keep police off it,
+    // so it can be jailed still-wanted and later broken out or pardoned.
     if (hooks.setAction) hooks.setAction(r, 'grabbed by the Manipulator', 'The Manipulator seized ' + r.name);
     M.grabYaw = M.yaw;
     M.fsm = 'GRAB';
@@ -212,7 +213,8 @@ export function init(opts) {
   function finishGrab() {
     const r = robots().get(M.targetId);
     if (r) {
-      if (M.dropCell && hooks.jailRobotInYard) hooks.jailRobotInYard(r, M.dropCell);
+      if (M.dropCell && M.dropCell.index != null && hooks.jailRobotInCell) hooks.jailRobotInCell(r, M.dropCell.index);
+      else if (M.dropCell && hooks.jailRobotInYard) hooks.jailRobotInYard(r, M.dropCell);
       else { r.heldY = 0; r.fsm = 'WANDER'; }
     }
     M.targetId = null;
